@@ -4,7 +4,7 @@ The Modding Tavern — Server Launcher
 
 # Bump this with every release you publish to
 # github.com/ModdingTavern/TavernLauncher/releases (tag it vX.Y.Z to match).
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 
 # The subfolder this app occupies inside the release zip
 # (TavernLauncher-vX.Y.Z.zip contains /Client and /Server side by side) —
@@ -379,79 +379,183 @@ def _is_whitelisted(username, ip):
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONSOLE CLIENT  (sends commands to the game's remote console on port 1758)
+#  WS CONSOLE CLIENT  (WebSocket console on port 1760)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ConsoleClient:
-    """Lightweight client for the game's binary-framed remote console."""
-    def __init__(self):
-        self._sock   = None
-        self._lock   = threading.Lock()
-        self._token  = ""
-        self._connected = False
+WS_CONSOLE_PORT = 1760
 
-    def connect(self, host="127.0.0.1", port=CONSOLE_PORT):
-        token_file = CONSOLE_TOKEN_FILE
+class WsConsoleClient:
+    """WebSocket client for the game console on port 1760."""
+
+    def __init__(self):
+        self._ws        = None
+        self._lock      = threading.Lock()
+        self._connected = False
+        self._cmd_id    = 0
+        self._pending   = {}   # {cmd_id: (event, holder)}
+        self._stop      = threading.Event()
+        self._on_line   = None
+        self._on_disc   = None
+
+    def connect(self, host, token, on_line=None, on_disc=None, timeout=6):
+        """Block until auth succeeds or fails. Returns (True, name) or (False, err)."""
+        import websocket as _wslib
+        self._on_line = on_line
+        self._on_disc = on_disc
+        self._stop.clear()
         try:
-            with open(token_file) as f: self._token = f.read().strip()
-        except:
-            return False, "console_token.txt not found"
-        try:
-            s = socket.socket()
-            s.settimeout(4)
-            s.connect((host, port))
-            s.sendall(self._token.encode("utf-8"))
-            resp = s.recv(64).decode("utf-8", errors="replace").strip()
-            if resp != "ok":
-                s.close()
-                return False, f"Console rejected token: {resp}"
-            self._sock = s
-            self._connected = True
-            return True, "ok"
+            ws = _wslib.WebSocket()
+            ws.settimeout(timeout)
+            ws.connect(f"ws://{host}:{WS_CONSOLE_PORT}")
+            ws.send(token)
+            raw = ws.recv()
+            msg = json.loads(raw)
+            if msg.get("type") == "SystemMessage":
+                data = str(msg.get("data", ""))
+                if "Connection Succeeded" in data:
+                    ws.settimeout(None)
+                    self._ws = ws
+                    self._connected = True
+                    threading.Thread(target=self._recv_loop, daemon=True).start()
+                    return True, data
+                ws.close()
+                return False, data
+            ws.close()
+            return False, f"Unexpected auth response: {msg}"
         except Exception as e:
             return False, str(e)
 
-    def send_command(self, cmd):
-        if not self._connected or not self._sock:
-            return None, "Not connected"
-        try:
-            with self._lock:
-                payload = cmd.encode("utf-8")
-                # 4-byte int32 length + 1-byte type (0 = ConsoleCommand)
-                header  = struct.pack("<IB", len(payload), 0)
-                self._sock.sendall(header + payload)
-                # Response: 2-byte ushort length + 1-byte type + payload
-                raw = self._sock.recv(65536)
-                if len(raw) >= 3:
-                    length = struct.unpack_from("<H", raw, 0)[0]
-                    text   = raw[3:3+length].decode("utf-8", errors="replace")
-                    return text, None
-                return "", None
-        except Exception as e:
-            self._connected = False
-            return None, str(e)
-
     def disconnect(self):
+        self._stop.set()
         self._connected = False
-        if self._sock:
-            try: self._sock.close()
+        ws, self._ws = self._ws, None
+        if ws:
+            try: ws.close()
             except: pass
-            self._sock = None
+        with self._lock:
+            for ev, holder in self._pending.values():
+                holder["error"] = "Disconnected"
+                ev.set()
+            self._pending.clear()
 
-_console = ConsoleClient()
+    def send(self, cmd):
+        """Fire-and-forget — output arrives via on_line callback."""
+        if not self._connected or not self._ws:
+            return
+        with self._lock:
+            self._cmd_id += 1
+            cid = self._cmd_id
+        try:
+            self._ws.send(json.dumps({"id": cid, "content": cmd}))
+        except Exception:
+            pass
+
+    def send_capture(self, cmd, timeout=20.0):
+        """Send and block until response. Returns (result_string, result_data, error)."""
+        if not self._connected or not self._ws:
+            return "", None, "Not connected"
+        with self._lock:
+            self._cmd_id += 1
+            cid    = self._cmd_id
+            ev     = threading.Event()
+            holder = {"result_string": "", "result_data": None, "error": None}
+            self._pending[cid] = (ev, holder)
+        try:
+            self._ws.send(json.dumps({"id": cid, "content": cmd}))
+        except Exception as e:
+            with self._lock:
+                self._pending.pop(cid, None)
+            return "", None, str(e)
+        ev.wait(timeout)
+        with self._lock:
+            self._pending.pop(cid, None)
+        return holder["result_string"], holder["result_data"], holder["error"]
+
+    def _recv_loop(self):
+        ws = self._ws
+        while not self._stop.is_set():
+            try:
+                raw = ws.recv()
+                if not raw:
+                    break
+                self._handle(raw)
+            except Exception as e:
+                if not self._stop.is_set():
+                    self._connected = False
+                    reason = str(e) or "Connection lost"
+                    if self._on_disc:
+                        self._on_disc(reason)
+                    with self._lock:
+                        for ev, holder in self._pending.values():
+                            holder["error"] = reason
+                            ev.set()
+                        self._pending.clear()
+                break
+
+    def _handle(self, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            if self._on_line:
+                self._on_line(raw + "\n")
+            return
+        msg_type = msg.get("type", "")
+        data     = msg.get("data")
+        cmd_id   = msg.get("commandId")
+
+        if msg_type == "CommandResult":
+            rs = ""
+            rd = None
+            if isinstance(data, dict):
+                rs = str(data.get("ResultString") or "")
+                rd = data.get("Result")
+            elif data is not None:
+                rs = str(data)
+            if self._on_line:
+                if rs and not rs.startswith("System."):
+                    self._on_line(rs if rs.endswith("\n") else rs + "\n")
+                elif rd is not None and rd != [] and rd != "":
+                    import json as _json
+                    try:
+                        display = _json.dumps(rd, indent=2)
+                    except Exception:
+                        display = str(rd)
+                    self._on_line(display + "\n")
+            # Unblock any waiting capture
+            if cmd_id is not None:
+                with self._lock:
+                    entry = self._pending.get(cmd_id)
+                if entry:
+                    entry[1]["result_string"] = rs
+                    entry[1]["result_data"]   = rd
+                    entry[0].set()
+
+        elif msg_type == "SystemMessage":
+            text = str(data) if data else ""
+            if text and self._on_line:
+                self._on_line(f"[{text}]\n")
+        else:
+            if self._on_line:
+                self._on_line(raw + "\n")
+
 
 def kick_player(username, ban=False):
-    """Kick (and optionally ban) a live player via the game console."""
-    ok, err = _console.connect()
+    """Kick (and optionally ban) a player via the WebSocket console."""
+    try:
+        with open(CONSOLE_TOKEN_FILE) as f:
+            token = f.read().strip()
+    except Exception:
+        return False, "console_token.txt not found — start the server first"
+    ws = WsConsoleClient()
+    ok, msg = ws.connect("127.0.0.1", token)
     if not ok:
-        return False, f"Console not available: {err}"
-    if ban:
-        out, err = _console.send_command(f'player ban "{username}"')
-    else:
-        out, err = _console.send_command(f'player kick "{username}"')
-    _console.disconnect()
-    if err: return False, err
-    return True, out or "Done"
+        return False, f"Console not available: {msg}"
+    cmd = f'player ban "{username}"' if ban else f'player kick "{username}"'
+    rs, rd, err = ws.send_capture(cmd, timeout=6)
+    ws.disconnect()
+    if err:
+        return False, err
+    return True, rs or "Done"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTH SERVICE
@@ -878,25 +982,81 @@ def start_auth_service(log_fn, port=AUTH_PORT):
     threading.Thread(target=serve, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  JWT
+#  JWT  +  SERVER SECRET
 # ══════════════════════════════════════════════════════════════════════════════
 
+SERVER_SECRET_FILE = os.path.join(_tavern_data_dir(), "server_secret.key")
+
+def _load_or_create_server_secret():
+    """
+    Load the persistent per-machine server secret, or generate one if it
+    doesn't exist. Stored as a 64-char hex string. Never changes unless
+    the file is deleted, so console_token stays stable across restarts.
+    Called fresh every time a token needs signing (see _jwt) rather than
+    cached once — so deleting the file while the launcher is already
+    running gets noticed and recreated on the next server start, not only
+    on a full launcher restart.
+    """
+    if os.path.isfile(SERVER_SECRET_FILE):
+        try:
+            secret = bytes.fromhex(open(SERVER_SECRET_FILE).read().strip())
+            if len(secret) == 32:
+                return secret
+        except Exception:
+            pass
+    secret = os.urandom(32)
+    try:
+        os.makedirs(_tavern_data_dir(), exist_ok=True)
+        with open(SERVER_SECRET_FILE, "w") as f:
+            f.write(secret.hex())
+    except Exception:
+        pass
+    return secret
+
 def _b64url(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-def _jwt(payload):
+
+def _jwt(payload, key=None):
+    """Build a HS256 JWT signed with key (defaults to the server secret).
+    Deliberately re-checks the secret file's actual current state on every
+    call rather than caching it once — if server_secret.key gets deleted
+    while the launcher is already running, this is what notices that on
+    the next server start and recreates it, instead of only noticing on a
+    full launcher restart (which is what re-running the module-level load
+    used to depend on)."""
+    if key is None:
+        key = _load_or_create_server_secret()
     h = _b64url(b'{"alg":"HS256","typ":"JWT"}')
-    b = _b64url(json.dumps(payload,separators=(",",":")).encode())
-    s = _b64url(_hmac.new(b"offline",f"{h}.{b}".encode(),hashlib.sha256).digest())
+    b = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    s = _b64url(_hmac.new(key, f"{h}.{b}".encode(), hashlib.sha256).digest())
     return f"{h}.{b}.{s}"
 
+def build_console_token():
+    """
+    Build the console auth token signed with this server's unique secret.
+    Written to console_token.txt — the only credential the WS console accepts.
+    """
+    return _jwt({
+        "UserId": "0", "Username": "Server", "role": "Access",
+        "is_verified": "True", "is_member": "True", "server_id": "-1",
+        "Policy": ["offline", "play_offline", "server_access_pre_alpha",
+                   "game_access_public", "server_owner", "debug_features",
+                   "database_admin", "reuse_refresh_tokens"],
+        "exp": 9999999999, "iss": "AltaWebAPI", "aud": "AltaClient"
+    })  # signed with the current server secret — see _jwt()
+
 def build_server_tokens():
+    """Build game tokens signed with 'offline' as the engine expects.
+    These are NOT used for console auth."""
     exp = 9999999999
+    key = b"offline"
     a = _jwt({"UserId":"0","Username":"Server","role":"Access","is_verified":"True",
-              "is_member":"True","Policy":["offline","play_offline","server_access_pre_alpha",
+              "is_member":"True","server_id":"-1",
+              "Policy":["offline","play_offline","server_access_pre_alpha",
               "game_access_public","server_owner","debug_features","database_admin",
-              "reuse_refresh_tokens"],"exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
-    r = _jwt({"UserId":"0","role":"Refresh","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
+              "reuse_refresh_tokens"],"exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"}, key)
+    r = _jwt({"UserId":"0","role":"Refresh","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"}, key)
     i = _jwt({"UserId":"0","Username":"Server","role":"Identity","is_member":"True",
-              "is_dev":"True","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"})
+              "is_dev":"True","exp":exp,"iss":"AltaWebAPI","aud":"AltaClient"}, key)
     return a, r, i
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1435,7 +1595,7 @@ class ConsoleWindow(tk.Toplevel):
         self.geometry("640x480")
         self.resizable(True, True)
         _set_window_icon(self)
-        self._sock      = None
+        self._ws_client = None
         self._connected = False
         self._stop      = threading.Event()
         self._build()
@@ -1605,49 +1765,21 @@ class ConsoleWindow(tk.Toplevel):
             self._status_var.set("No console token")
             self._append("console_token.txt not found — start the server first.\n", "err")
             return
+        self._ws_client = WsConsoleClient()
 
         def worker():
-            try:
-                s = socket.socket()
-                s.settimeout(4)
-                s.connect(("127.0.0.1", CONSOLE_PORT))
-                s.sendall(token.encode("utf-8"))
-                resp = s.recv(64).decode("utf-8", errors="replace").strip()
-                if resp != "ok":
-                    self.after(0, lambda: self._status_var.set(f"Rejected: {resp}"))
-                    return
-                s.settimeout(None)
-                self._sock = s
+            ok, msg = self._ws_client.connect(
+                "127.0.0.1", token,
+                on_line=lambda t: self.after(0, lambda p=t: self._append(p)),
+                on_disc=lambda r: self.after(0, lambda: self._on_disconnected(r)),
+            )
+            if ok:
                 self._connected = True
                 self.after(0, lambda: self._status_var.set("Connected"))
                 self.after(0, lambda: self._append("[Connected]\n", "ok"))
-                self._receive_loop()
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._status_var.set(f"Error: {err}"))
+            else:
+                self.after(0, lambda m=msg: self._status_var.set(f"Error: {m}"))
         threading.Thread(target=worker, daemon=True).start()
-
-    def _receive_loop(self):
-        buf, s = b"", self._sock
-        while not self._stop.is_set():
-            try:
-                data = s.recv(65536)
-                if not data:
-                    self.after(0, lambda: self._on_disconnected("Server closed the connection."))
-                    return
-                buf += data
-                # 2-byte ushort length + 1-byte type header, matching
-                # ConsoleClient.send_command's response framing.
-                while len(buf) >= 3:
-                    length = struct.unpack_from("<H", buf, 0)[0]
-                    if len(buf) < 3 + length:
-                        break
-                    payload = buf[3:3+length].decode("utf-8", errors="replace")
-                    buf = buf[3+length:]
-                    self.after(0, lambda p=payload: self._append(p))
-            except OSError:
-                if not self._stop.is_set():
-                    self.after(0, lambda: self._on_disconnected("Connection lost."))
-                return
 
     def _on_disconnected(self, msg):
         self._connected = False
@@ -1656,23 +1788,16 @@ class ConsoleWindow(tk.Toplevel):
 
     def _send(self):
         cmd = self.v_cmd.get().strip()
-        if not cmd or not self._connected or not self._sock:
+        if not cmd or not self._connected:
             return
         self.v_cmd.set("")
         self._append(f"> {cmd}\n", "cyan")
-        try:
-            payload = cmd.encode("utf-8")
-            # 4-byte int32 length + 1-byte type (0 = ConsoleCommand)
-            header = struct.pack("<IB", len(payload), 0)
-            self._sock.sendall(header + payload)
-        except Exception as e:
-            self._append(f"[Send failed: {e}]\n", "err")
+        self._ws_client.send(cmd)
 
     def _on_close(self):
         self._stop.set()
-        if self._sock:
-            try: self._sock.close()
-            except Exception: pass
+        if hasattr(self, "_ws_client"):
+            self._ws_client.disconnect()
         self.destroy()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2470,10 +2595,25 @@ def _install_circuitsvoicechat(game_dir, on_progress):
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, name)
         if downloaded_files is not None:
+            expected_hash = hashlib.sha256(downloaded_files[name]).hexdigest()
             with open(dest_path, "wb") as f:
                 f.write(downloaded_files[name])
         else:
+            expected_hash = _sha256_file(manual_paths[name])
             shutil.copy2(manual_paths[name], dest_path)
+        # A silently-blocked write (Controlled Folder Access is a
+        # documented example) can leave this looking like it succeeded —
+        # no exception, no error — while the file on disk never actually
+        # changed. Reading it back and comparing is the only reliable way
+        # to tell a real success apart from that.
+        if not os.path.isfile(dest_path) or _sha256_file(dest_path) != expected_hash:
+            raise RuntimeError(
+                f"{name} was written without any error, but checking it afterward shows "
+                "it doesn't match what was just downloaded/copied. This usually means "
+                "something on this PC silently blocked the write — most commonly Windows' "
+                "Controlled Folder Access, or antivirus real-time protection. Try adding an "
+                "exclusion for the game's install folder in Windows Security (or your "
+                "antivirus), or temporarily disabling Controlled Folder Access, then try again.")
 
     meta = _load_mod_meta(game_dir)
     if downloaded_files is not None and tag:
@@ -2688,6 +2828,23 @@ def _install_melonloader(game_dir, arch, on_progress):
         try: os.remove(tmp_zip)
         except Exception: pass
 
+    # A silently-blocked write (Controlled Folder Access is a documented
+    # example) can leave extractall() looking like it succeeded — no
+    # exception raised — while some or all of the files it just wrote
+    # never actually landed on disk. Checking every extracted file's hash
+    # would be overkill for something that installs dozens of them; the
+    # two files _melonloader_installed already treats as proof of a real
+    # install are a reasonable, proportionate stand-in for "did this
+    # actually work."
+    if not _melonloader_installed(game_dir):
+        raise RuntimeError(
+            "MelonLoader was extracted without any error, but checking afterward shows "
+            "the expected files aren't actually there. This usually means something on "
+            "this PC silently blocked the write — most commonly Windows' Controlled "
+            "Folder Access, or antivirus real-time protection. Try adding an exclusion "
+            "for the game's install folder in Windows Security (or your antivirus), or "
+            "temporarily disabling Controlled Folder Access, then try again.")
+
     meta = _load_mod_meta(game_dir)
     if downloaded_ok and tag:
         meta["melonloader_tag"] = tag
@@ -2735,7 +2892,23 @@ def _install_tavernlib(game_dir, on_progress):
         shutil.copy2(manual_dll, tmp_dest)
         fingerprint = f"bundled:{_sha256_file(manual_dll)[:12]}"
 
+    # Captured before the replace, since tmp_dest won't exist anymore
+    # afterward — os.replace renames it, it doesn't leave a copy behind.
+    expected_hash = _sha256_file(tmp_dest)
     os.replace(tmp_dest, dest)  # atomic on Windows — always a full swap, never a partial one
+    if not os.path.isfile(dest) or _sha256_file(dest) != expected_hash:
+        # A silently-blocked write (Controlled Folder Access is a
+        # documented example) can leave os.replace appearing to succeed
+        # with the old file — or nothing at all — actually still there.
+        # Reading the result back and comparing is the only reliable way
+        # to tell a real success apart from that.
+        raise RuntimeError(
+            "TavernLib.dll was written without any error, but checking it afterward "
+            "shows it doesn't match what was just downloaded. This usually means "
+            "something on this PC silently blocked the write — most commonly Windows' "
+            "Controlled Folder Access, or antivirus real-time protection. Try adding an "
+            "exclusion for the game's install folder in Windows Security (or your "
+            "antivirus), or temporarily disabling Controlled Folder Access, then try again.")
     if fingerprint:
         meta = _load_mod_meta(game_dir)
         meta["tavernlib_fingerprint"] = fingerprint
@@ -2792,6 +2965,12 @@ def _mods_need_attention(game_dir):
 # themoddingtavern.dll lives in a Patch/ folder next to this launcher exe.
 # Applying the patch means copying it into the game's Assembly folder under
 # the name Root.Township.dll (replacing whatever was there before).
+# themoddingtavern.dll lives in a Patch/ folder next to this launcher exe,
+# but a canonical copy is now also published as a GitHub release asset —
+# this lets an already-built launcher pick up a newer patch DLL without
+# needing a whole new launcher release, the same way TavernLib/MelonLoader
+# updates already work independently of the launcher's own version.
+PATCH_DOWNLOAD_URL = "https://github.com/ModdingTavern/TavernDefaults/releases/latest/download/themoddingtavern.dll"
 PATCH_SOURCE_FILENAME = "themoddingtavern.dll"
 PATCH_TARGET_SUBDIR   = os.path.join("A Township Tale_Data", "Managed")
 PATCH_TARGET_FILENAME = "Root.Township.dll"
@@ -2835,21 +3014,83 @@ def _patch_is_applied(game_exe):
         return False
 
 
-def apply_patch(game_exe):
-    """Copy themoddingtavern.dll -> <game>/.../Managed/Root.Township.dll.
-    Raises RuntimeError with a user-friendly message on any failure."""
-    src = _patch_source_path()
-    if not os.path.isfile(src):
-        raise RuntimeError(
-            f"Patch file not found:\n{src}\n\n"
-            "Make sure the Patch folder is in the same directory as this launcher.")
+def apply_patch(game_exe, on_progress=None):
+    """Installs themoddingtavern.dll as Root.Township.dll in the game's
+    Managed folder. Prioritizes the latest release published at
+    ModdingTavern/TavernDefaults on GitHub — falls back to whatever's
+    bundled in Patch/ next to this launcher if GitHub can't be reached
+    for any reason (offline, firewall, GitHub itself down, etc.), exactly
+    like the old, GitHub-unaware version of this function always did.
+    Either way, compares against what's already installed first and skips
+    the actual write entirely if it already matches, rather than always
+    replacing unconditionally.
+
+    Returns one of:
+      "downloaded" — installed the latest version fetched from GitHub
+      "bundled"    — GitHub wasn't reachable; installed the local Patch/ copy instead
+      "current"    — what's already installed already matches; nothing changed
+
+    Raises RuntimeError with a user-friendly message on any failure —
+    including a *silent* one: some Windows security features (Controlled
+    Folder Access is a documented example) can intercept a file write and
+    let the calling process believe it succeeded without the change
+    actually landing on disk. From this code's side, that looks identical
+    to a real, successful copy — shutil.copy2/os.replace raise nothing
+    either way. The only reliable way to catch it is to read the
+    destination back afterward and confirm it actually matches what was
+    just written, rather than trusting the write call's own apparent
+    success."""
+    if on_progress is None:
+        on_progress = lambda msg: None
+
     dst = _patch_target_path(game_exe)
     managed_dir = os.path.dirname(dst)
     if not os.path.isdir(managed_dir):
         raise RuntimeError(
             f"Game Managed folder not found:\n{managed_dir}\n\n"
             "Double-check the game exe path at the top of the launcher.")
-    shutil.copy2(src, dst)
+
+    tmp_dest = dst + ".download"
+    try:
+        try:
+            on_progress("Checking for the latest patch…")
+            _download_with_progress(PATCH_DOWNLOAD_URL, tmp_dest, on_progress,
+                                     connect_timeout=8, max_total_seconds=20)
+            source = "downloaded"
+        except Exception:
+            local_src = _patch_source_path()
+            if not os.path.isfile(local_src):
+                raise RuntimeError(
+                    "Couldn't reach GitHub to check for the latest patch, and no "
+                    f"bundled copy was found in Patch/ either.\n\nExpected at:\n{local_src}")
+            on_progress("Couldn't reach GitHub — using the version bundled with this launcher…")
+            shutil.copy2(local_src, tmp_dest)
+            source = "bundled"
+
+        new_hash = _sha256_file(tmp_dest)
+        if os.path.isfile(dst) and _sha256_file(dst) == new_hash:
+            # Already exactly what we'd install — skip the write entirely
+            # rather than rewriting (and re-triggering AV scanning of) a
+            # file that's already correct.
+            return "current"
+
+        os.replace(tmp_dest, dst)  # atomic on Windows — always a full swap, never a partial one
+        if not os.path.isfile(dst) or _sha256_file(dst) != new_hash:
+            raise RuntimeError(
+                "The file was written without any error, but checking it afterward "
+                "shows it doesn't match what was just installed. This usually means "
+                "something on this PC silently blocked the write — most commonly "
+                "Windows' Controlled Folder Access, or antivirus real-time protection. "
+                "Try adding an exclusion for the game's install folder in Windows "
+                "Security (or your antivirus), or temporarily disabling Controlled "
+                "Folder Access, then try again.")
+        return source
+    finally:
+        try:
+            if os.path.isfile(tmp_dest):
+                os.remove(tmp_dest)
+        except Exception:
+            pass
 
 
 class ModsWindow(tk.Toplevel):
@@ -3401,8 +3642,28 @@ class ServerLauncher(tk.Tk):
                                       command=lambda: webbrowser.open(DISCORD_URL))
         self._discord_btn_item = canvas.create_window(0, 32, anchor="e", window=self._discord_btn)
 
+        self._copy_token_btn = tk.Button(canvas, text="📋 Copy Console Token", bg=SURF2, fg=PARCH,
+                                         activebackground=AMBERDIM, activeforeground="#ffd080",
+                                         relief="flat", bd=0, cursor="hand2",
+                                         font=("Segoe UI",9), padx=10, pady=4,
+                                         command=self._copy_console_token)
+        self._copy_token_btn_item = canvas.create_window(0, 32, anchor="e", window=self._copy_token_btn)
+
         canvas.bind("<Configure>", self._on_header_resize)
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+    def _copy_console_token(self):
+        try:
+            with open(CONSOLE_TOKEN_FILE) as f:
+                token = f.read().strip()
+            self.clipboard_clear()
+            self.clipboard_append(token)
+            # Brief visual feedback
+            self._copy_token_btn.config(text="✓ Copied!")
+            self.after(1500, lambda: self._copy_token_btn.config(text="📋 Copy Console Token"))
+        except FileNotFoundError:
+            messagebox.showinfo("No token yet",
+                "Start the server first to generate a console token.", parent=self)
 
     def _on_header_resize(self, event):
         """Rescales the banner to fill the header exactly, and keeps the
@@ -3424,6 +3685,9 @@ class ServerLauncher(tk.Tk):
             except Exception:
                 pass
         self._header_canvas.coords(self._discord_btn_item, w - 14, hgt // 2)
+        # Copy Console Token sits to the left of Discord
+        dw = self._discord_btn.winfo_reqwidth()
+        self._header_canvas.coords(self._copy_token_btn_item, w - 14 - dw - 8, hgt // 2)
 
     def _load(self):
         cfg = load_cfg()
@@ -3653,10 +3917,16 @@ class ServerLauncher(tk.Tk):
 
         def worker():
             try:
-                apply_patch(exe)
+                result = apply_patch(exe)
+                messages = {
+                    "downloaded": "Downloaded the latest Tavern patch from GitHub and applied it.",
+                    "bundled": "Couldn't reach GitHub, so the version bundled with this "
+                               "launcher was applied instead.",
+                    "current": "Already up to date — no changes were needed.",
+                }
+                msg = messages.get(result, "Root.Township.dll has been replaced with the Tavern patch.")
                 self.after(0, lambda: (
-                    messagebox.showinfo("Patch applied",
-                        "Root.Township.dll has been replaced with the Tavern patch.", parent=self),
+                    messagebox.showinfo("Patch applied", msg, parent=self),
                     self._refresh_patch_alert(exe)))
             except RuntimeError as e:
                 self.after(0, lambda err=str(e): messagebox.showerror("Patch failed", err, parent=self))
@@ -3704,9 +3974,10 @@ class ServerLauncher(tk.Tk):
         except: port = 1757
         self._save()
         access, refresh, identity = build_server_tokens()
+        console_token = build_console_token()
         try:
             with open(CONSOLE_TOKEN_FILE,"w") as f:
-                f.write(access)
+                f.write(console_token)
         except: pass
         if not self._auth_on:
             start_auth_service(self._print)
