@@ -4029,9 +4029,6 @@ class ServerLauncher(tk.Tk):
                 try: self._proc.terminate()
                 except: pass
 
-                self._set_running(False)
-                self._proc = None
-
         self._set_running(False); self._proc = None
 
     def _set_running(self, on):
