@@ -4015,8 +4015,23 @@ class ServerLauncher(tk.Tk):
 
     def _stop(self):
         if self._proc:
-            try: self._proc.terminate(); self._print("Closing server…", "warn")
-            except Exception as e: self._print(f"Stop failed: {e}", "err")
+            try:
+                if sys.platform == "win32":
+                    os.system(f"taskkill /PID {self._proc.pid}")
+                else:
+                    # I don't know if this actually works for Linux systems or not, I can't test it.
+                    subprocess.run("wmctrl", "-c", "A Township Tale")
+
+                self._print("Closing server…", "warn")
+            except Exception as e:
+                self._print(f"Stop failed: {e}", "err")
+
+                try: self._proc.terminate()
+                except: pass
+
+                self._set_running(False)
+                self._proc = None
+
         self._set_running(False); self._proc = None
 
     def _set_running(self, on):
